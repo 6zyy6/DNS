@@ -1,0 +1,14 @@
+.DS_Store
+*.md
+!/README.md
+build/
+*.class
+evidence/nslookup/*.txt
+evidence/nslookup/*.csv
+evidence/nslookup/*.log
+evidence/pcaps/*.pcap
+evidence/pcaps/*.pcapng
+evidence/screenshots/*.png
+evidence/screenshots/*.jpg
+evidence/screenshots/*.jpeg
+evidence/screenshots/*.gif

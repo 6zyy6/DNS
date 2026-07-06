@@ -1,0 +1,10 @@
+# Format: IPv4 domain
+# 0.0.0.0 means blocked and returns NXDOMAIN.
+0.0.0.0 www.666.com
+0.0.0.0 blocked.test
+1.2.3.4 local.test
+114.255.40.66 www.bupt.com.cn
+1.1.1.1 a.com
+1.1.1.2 a.com
+2001:db8::1 a.com
+2001:db8::2 a.com
