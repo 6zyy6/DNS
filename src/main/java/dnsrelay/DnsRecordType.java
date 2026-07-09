@@ -2,6 +2,7 @@ package dnsrelay;
 
 public enum DnsRecordType {
     A(1, "A"),
+    CNAME(5, "CNAME"),
     AAAA(28, "AAAA"),
     UNKNOWN(-1, "UNKNOWN");
 

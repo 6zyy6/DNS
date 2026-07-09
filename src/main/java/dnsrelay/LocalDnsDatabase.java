@@ -65,11 +65,29 @@ public final class LocalDnsDatabase {
 
         String[] parts = line.split("\\s+");
         if (parts.length < 2) {
-            warn(warnings, lineNumber, rawLine, "expected: IPv4 domain");
+            warn(warnings, lineNumber, rawLine, "expected: IP domain or CNAME target domain");
             return;
         }
 
         try {
+            if (parts[0].equalsIgnoreCase("CNAME")) {
+                if (parts.length < 3) {
+                    warn(warnings, lineNumber, rawLine, "expected: CNAME target domain");
+                    return;
+                }
+                String target = DnsName.normalize(parts[1]);
+                String domain = DnsName.normalize(parts[2]);
+                DnsName.encode(target);
+                DnsName.encode(domain);
+                Entry existing = entries.get(domain);
+                if (existing == null) {
+                    existing = new Entry();
+                    entries.put(domain, existing);
+                }
+                existing.setCnameTarget(target);
+                return;
+            }
+
             InetAddress address = parseAddress(parts[0]);
             String domain = DnsName.normalize(parts[1]);
             DnsName.encode(domain);
@@ -133,11 +151,13 @@ public final class LocalDnsDatabase {
 
     public static final class Entry {
         private final List<InetAddress> addresses = new ArrayList<InetAddress>();
+        private String cnameTarget;
 
         void add(InetAddress address) {
             if (isBlockedAddress(address)) {
                 addresses.clear();
                 addresses.add(address);
+                cnameTarget = null;
                 return;
             }
             if (!isBlocked()) {
@@ -145,8 +165,19 @@ public final class LocalDnsDatabase {
             }
         }
 
+        void setCnameTarget(String target) {
+            if (isBlocked()) {
+                return;
+            }
+            cnameTarget = target;
+        }
+
         public InetAddress address() {
             return addresses.get(0);
+        }
+
+        public Optional<String> cnameTarget() {
+            return Optional.ofNullable(cnameTarget);
         }
 
         public List<InetAddress> addressesFor(DnsRecordType recordType) {
@@ -164,6 +195,16 @@ public final class LocalDnsDatabase {
 
         public boolean isBlocked() {
             return !addresses.isEmpty() && isBlockedAddress(addresses.get(0));
+        }
+
+        public boolean hasLocalRecordType(DnsRecordType recordType) {
+            if (recordType == DnsRecordType.CNAME) {
+                return cnameTarget != null;
+            }
+            if (recordType == DnsRecordType.A || recordType == DnsRecordType.AAAA) {
+                return !addressesFor(recordType).isEmpty();
+            }
+            return false;
         }
 
         private static boolean isBlockedAddress(InetAddress address) {
