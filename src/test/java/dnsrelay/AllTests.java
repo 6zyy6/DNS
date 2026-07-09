@@ -21,6 +21,14 @@ public final class AllTests {
         run("loadsMultipleIpv4AndIpv6Records", AllTests::loadsMultipleIpv4AndIpv6Records);
         run("reloadsLocalDatabaseAfterFileChange", AllTests::reloadsLocalDatabaseAfterFileChange);
         run("mapsForwardedIdsBackToClientRequests", AllTests::mapsForwardedIdsBackToClientRequests);
+        run("cachesUpstreamResponsesByQuestion", AllTests::cachesUpstreamResponsesByQuestion);
+        run("expiresCachedResponsesAfterTtl", AllTests::expiresCachedResponsesAfterTtl);
+        run("extractsMinimumTtlFromAnswerSection", AllTests::extractsMinimumTtlFromAnswerSection);
+        run("buildsEmptyResponseForLocalDomain", AllTests::buildsEmptyResponseForLocalDomain);
+        run("buildsLocalCnameResponse", AllTests::buildsLocalCnameResponse);
+        run("loadsLocalCnameRecords", AllTests::loadsLocalCnameRecords);
+        run("detectsTruncatedDnsResponses", AllTests::detectsTruncatedDnsResponses);
+        run("tracksQueryStatisticsCategories", AllTests::tracksQueryStatisticsCategories);
         run("rejectsMultipleQuestionPackets", AllTests::rejectsMultipleQuestionPackets);
         run("rejectsCompressedQuestionNames", AllTests::rejectsCompressedQuestionNames);
         run("rejectsInvalidQuestionLabels", AllTests::rejectsInvalidQuestionLabels);
@@ -160,9 +168,17 @@ public final class AllTests {
 
     private static void mapsForwardedIdsBackToClientRequests() throws Exception {
         IdMapper mapper = new IdMapper();
-        InetSocketAddress client = new InetSocketAddress("127.0.0.1", 53000);
+        byte[] query = queryPacket(0x1111, "www.example.com", DnsRecordType.A);
+        ClientContext client = ClientContext.udp(new InetSocketAddress("127.0.0.1", 53000), null);
 
-        IdMapper.PendingQuery pending = mapper.register(0x1111, client, "www.example.com", DnsRecordType.A.code(), 1);
+        IdMapper.PendingQuery pending = mapper.register(
+                0x1111,
+                client,
+                query,
+                query.length,
+                "www.example.com",
+                DnsRecordType.A.code(),
+                1);
 
         assertTrue(pending.forwardedId() >= 0 && pending.forwardedId() <= 0xFFFF, "forwarded id must be 16-bit");
         assertEquals(false, pending.forwardedId() == 0x1111);
@@ -172,6 +188,113 @@ public final class AllTests {
         assertEquals(DnsRecordType.A.code(), pending.queryType());
         assertEquals(1, pending.queryClass());
         assertEquals(false, mapper.remove(pending.forwardedId()).isPresent());
+    }
+
+    private static void buildsEmptyResponseForLocalDomain() throws Exception {
+        byte[] query = queryPacket(0x7777, "local.test", DnsRecordType.AAAA);
+        DnsMessage request = DnsMessage.parse(query, query.length);
+
+        byte[] response = DnsMessage.buildEmptyResponse(request);
+
+        assertUnsignedShortEquals(0x7777, response, 0);
+        int flags = unsignedShort(response, 2);
+        assertTrue((flags & 0x8000) != 0, "response QR bit should be set");
+        assertEquals(0, flags & 0x000F);
+        assertUnsignedShortEquals(0, response, 6);
+    }
+
+    private static void buildsLocalCnameResponse() throws Exception {
+        byte[] query = queryPacket(0x8888, "alias.test", DnsRecordType.CNAME);
+        DnsMessage request = DnsMessage.parse(query, query.length);
+
+        byte[] response = DnsMessage.buildCnameResponse(request, "www.example.com", 120);
+
+        assertUnsignedShortEquals(1, response, 6);
+        int answerOffset = query.length;
+        assertUnsignedShortEquals(DnsRecordType.CNAME.code(), response, answerOffset + 2);
+    }
+
+    private static void loadsLocalCnameRecords() throws Exception {
+        Path file = Files.createTempFile("dnsrelay-cname", ".txt");
+        Files.write(file, Arrays.asList("CNAME www.example.com alias.test"));
+
+        LocalDnsDatabase database = LocalDnsDatabase.load(file, System.err);
+        LocalDnsDatabase.Entry entry = require(database.lookup("alias.test"));
+
+        assertEquals("www.example.com", require(entry.cnameTarget()));
+        assertEquals(true, entry.hasLocalRecordType(DnsRecordType.CNAME));
+    }
+
+    private static void detectsTruncatedDnsResponses() throws Exception {
+        byte[] query = queryPacket(0x9999, "big.test", DnsRecordType.A);
+        DnsMessage request = DnsMessage.parse(query, query.length);
+        byte[] response = DnsMessage.buildAResponse(request, InetAddress.getByName("1.2.3.4"), 120);
+        response[2] = (byte) (response[2] | 0x02);
+
+        assertEquals(true, DnsMessage.isTruncated(response, response.length));
+    }
+
+    private static void tracksQueryStatisticsCategories() {
+        QueryStatistics statistics = new QueryStatistics();
+
+        statistics.recordLocalHit();
+        statistics.recordBlocked();
+        statistics.recordCacheHit();
+        statistics.recordForwarded();
+
+        assertEquals(4L, statistics.totalQueries());
+        assertEquals(1L, statistics.localHits());
+        assertEquals(1L, statistics.blocked());
+        assertEquals(1L, statistics.cacheHits());
+        assertEquals(1L, statistics.forwarded());
+        assertTrue(statistics.summaryLine().contains("localHit=1"), statistics.summaryLine());
+        assertTrue(statistics.summaryLine().contains("blocked=1"), statistics.summaryLine());
+        assertTrue(statistics.summaryLine().contains("cacheHit=1"), statistics.summaryLine());
+        assertTrue(statistics.summaryLine().contains("forwarded=1"), statistics.summaryLine());
+    }
+
+    private static void cachesUpstreamResponsesByQuestion() throws Exception {
+        DnsResponseCache cache = new DnsResponseCache();
+        byte[] query = queryPacket(0x1111, "www.example.com", DnsRecordType.A);
+        DnsMessage request = DnsMessage.parse(query, query.length);
+        byte[] upstreamResponse = DnsMessage.buildAResponse(request, InetAddress.getByName("8.8.8.8"), 300);
+
+        cache.store("www.example.com", DnsRecordType.A.code(), 1, upstreamResponse, upstreamResponse.length);
+
+        assertTrue(cache.lookup("www.example.com", DnsRecordType.A.code(), 1).isPresent(),
+                "cached response should be available");
+        byte[] cached = require(cache.lookup("WWW.Example.COM.", DnsRecordType.A.code(), 1));
+        assertEquals(0x1111, unsignedShort(cached, 0));
+        assertEquals("8.8.8.8", InetAddress.getByAddress(Arrays.copyOfRange(cached, query.length + 12, query.length + 16)).getHostAddress());
+
+        byte[] forClient = DnsMessage.withId(cached, cached.length, 0x2222);
+        assertEquals(0x2222, unsignedShort(forClient, 0));
+        assertEquals(1, cache.size());
+    }
+
+    private static void expiresCachedResponsesAfterTtl() throws Exception {
+        DnsResponseCache cache = new DnsResponseCache();
+        byte[] query = queryPacket(0x3333, "expire.test", DnsRecordType.A);
+        DnsMessage request = DnsMessage.parse(query, query.length);
+        byte[] upstreamResponse = DnsMessage.buildAResponse(request, InetAddress.getByName("9.9.9.9"), 1);
+
+        cache.store("expire.test", DnsRecordType.A.code(), 1, upstreamResponse, upstreamResponse.length);
+        assertEquals(true, cache.lookup("expire.test", DnsRecordType.A.code(), 1).isPresent());
+
+        Thread.sleep(1100L);
+
+        assertEquals(false, cache.lookup("expire.test", DnsRecordType.A.code(), 1).isPresent());
+        assertEquals(0, cache.size());
+    }
+
+    private static void extractsMinimumTtlFromAnswerSection() throws Exception {
+        byte[] query = queryPacket(0x4444, "ttl.test", DnsRecordType.A);
+        DnsMessage request = DnsMessage.parse(query, query.length);
+        byte[] response = DnsMessage.buildAddressResponse(request, Arrays.asList(
+                InetAddress.getByName("1.1.1.1"),
+                InetAddress.getByName("1.1.1.2")), DnsRecordType.A, 45);
+
+        assertEquals(45, DnsResponseCache.extractTtlSeconds(response, response.length));
     }
 
     private static void rejectsMultipleQuestionPackets() throws Exception {

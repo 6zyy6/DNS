@@ -35,7 +35,11 @@ public final class DnsRelay {
         System.out.println("Database file: " + config.databaseFile());
         System.out.println("Loaded records: " + database.size());
         System.out.println("Debug mode: " + config.debugLevel());
-        System.out.println("AAAA policy: local IPv6 entries answer AAAA; domains without matching local record type are forwarded upstream unless blocked by 0.0.0.0");
+        System.out.println("AAAA policy: local A/AAAA hit returns answers; local domain without matching address type returns empty NOERROR; blocked domains return NXDOMAIN");
+        System.out.println("Local records: A, AAAA, CNAME; MX/PTR and other types are forwarded upstream when not locally configured");
+        System.out.println("Transport: UDP and TCP on the same listen port; upstream UDP responses with TC retry over TCP");
+        System.out.println("Upstream cache: enabled for forwarded responses (TTL from answer records, max 3600s)");
+        System.out.println("Query statistics: enabled (summary printed on exit; per-query snapshot with -d/-dd)");
 
         final DnsRelayServer server = new DnsRelayServer(
                 database,

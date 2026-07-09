@@ -7,7 +7,7 @@ import java.util.List;
 
 public final class DnsMessage {
     public static final int DNS_PORT = 53;
-    private static final int HEADER_LENGTH = 12;
+    static final int HEADER_LENGTH = 12;
     private static final int CLASS_IN = 1;
 
     private final byte[] packet;
@@ -100,6 +100,43 @@ public final class DnsMessage {
         writeHeader(out, request, 3, 0);
         writeQuestion(out, request);
         return out.toByteArray();
+    }
+
+    public static byte[] buildEmptyResponse(DnsMessage request) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeHeader(out, request, 0, 0);
+        writeQuestion(out, request);
+        return out.toByteArray();
+    }
+
+    public static byte[] buildCnameResponse(DnsMessage request, String cnameTarget, int ttlSeconds) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeHeader(out, request, 0, 1);
+        writeQuestion(out, request);
+        writeShort(out, 0xC00C);
+        writeShort(out, DnsRecordType.CNAME.code());
+        writeShort(out, CLASS_IN);
+        writeInt(out, ttlSeconds);
+        byte[] targetName = DnsName.encode(cnameTarget);
+        writeShort(out, targetName.length);
+        out.write(targetName, 0, targetName.length);
+        return out.toByteArray();
+    }
+
+    public static boolean isTruncated(byte[] data, int length) {
+        if (length < 4) {
+            return false;
+        }
+        int flags = unsignedShort(data, 2);
+        return (flags & 0x0200) != 0;
+    }
+
+    public static byte[] writeTcpFrame(byte[] message) {
+        byte[] framed = new byte[message.length + 2];
+        framed[0] = (byte) ((message.length >>> 8) & 0xFF);
+        framed[1] = (byte) (message.length & 0xFF);
+        System.arraycopy(message, 0, framed, 2, message.length);
+        return framed;
     }
 
     public static byte[] withId(byte[] data, int length, int id) {

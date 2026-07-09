@@ -1,6 +1,5 @@
 package dnsrelay;
 
-import java.net.InetSocketAddress;
 import java.security.SecureRandom;
 import java.util.Map;
 import java.util.Optional;
@@ -17,8 +16,17 @@ public final class IdMapper {
         this.sequence = new AtomicInteger(new SecureRandom().nextInt(0x10000));
     }
 
-    public PendingQuery register(int originalId, InetSocketAddress client, String queryName, int queryType, int queryClass) {
+    public PendingQuery register(
+            int originalId,
+            ClientContext client,
+            byte[] queryData,
+            int queryLength,
+            String queryName,
+            int queryType,
+            int queryClass) {
         cleanupExpired();
+        byte[] queryCopy = new byte[queryLength];
+        System.arraycopy(queryData, 0, queryCopy, 0, queryLength);
         for (int attempts = 0; attempts < 0x10000; attempts++) {
             int forwardedId = sequence.getAndIncrement() & 0xFFFF;
             if (forwardedId == (originalId & 0xFFFF)) {
@@ -28,6 +36,7 @@ public final class IdMapper {
                     originalId & 0xFFFF,
                     forwardedId,
                     client,
+                    queryCopy,
                     queryName,
                     queryType,
                     queryClass,
@@ -63,7 +72,8 @@ public final class IdMapper {
     public static final class PendingQuery {
         private final int originalId;
         private final int forwardedId;
-        private final InetSocketAddress client;
+        private final ClientContext client;
+        private final byte[] queryData;
         private final String queryName;
         private final int queryType;
         private final int queryClass;
@@ -72,7 +82,8 @@ public final class IdMapper {
         PendingQuery(
                 int originalId,
                 int forwardedId,
-                InetSocketAddress client,
+                ClientContext client,
+                byte[] queryData,
                 String queryName,
                 int queryType,
                 int queryClass,
@@ -80,6 +91,7 @@ public final class IdMapper {
             this.originalId = originalId;
             this.forwardedId = forwardedId;
             this.client = client;
+            this.queryData = queryData;
             this.queryName = queryName;
             this.queryType = queryType;
             this.queryClass = queryClass;
@@ -94,8 +106,12 @@ public final class IdMapper {
             return forwardedId;
         }
 
-        public InetSocketAddress client() {
+        public ClientContext client() {
             return client;
+        }
+
+        public byte[] queryData() {
+            return queryData;
         }
 
         public String queryName() {

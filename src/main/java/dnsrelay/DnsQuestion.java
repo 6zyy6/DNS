@@ -35,7 +35,7 @@ public final class DnsQuestion {
         return startOffset;
     }
 
-    int endOffset() {
+    public int endOffset() {
         return endOffset;
     }
 }
