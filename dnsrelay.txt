@@ -1,5 +1,5 @@
 # Format: IPv4 domain
-# 0.0.0.0 means blocked and returns NXDOMAIN.
+# 0.0.0.0 means blocked and returns REFUSED (rcode=5).
 0.0.0.0 www.666.com
 0.0.0.0 blocked.test
 1.2.3.4 local.test

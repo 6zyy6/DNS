@@ -16,7 +16,7 @@ public final class AllTests {
         run("buildsLocalARecordResponse", AllTests::buildsLocalARecordResponse);
         run("buildsMultipleARecordResponse", AllTests::buildsMultipleARecordResponse);
         run("buildsLocalAaaaRecordResponse", AllTests::buildsLocalAaaaRecordResponse);
-        run("buildsNxDomainForBlockedDomain", AllTests::buildsNxDomainForBlockedDomain);
+        run("buildsRefusedResponseForBlockedDomain", AllTests::buildsRefusedResponseForBlockedDomain);
         run("loadsLocalDatabaseAndSkipsBadLines", AllTests::loadsLocalDatabaseAndSkipsBadLines);
         run("loadsMultipleIpv4AndIpv6Records", AllTests::loadsMultipleIpv4AndIpv6Records);
         run("reloadsLocalDatabaseAfterFileChange", AllTests::reloadsLocalDatabaseAfterFileChange);
@@ -104,16 +104,16 @@ public final class AllTests {
         assertUnsignedShortEquals(16, response, answerOffset + 10);
     }
 
-    private static void buildsNxDomainForBlockedDomain() throws Exception {
+    private static void buildsRefusedResponseForBlockedDomain() throws Exception {
         byte[] query = queryPacket(0xCAFE, "blocked.test", DnsRecordType.A);
         DnsMessage request = DnsMessage.parse(query, query.length);
 
-        byte[] response = DnsMessage.buildNxDomainResponse(request);
+        byte[] response = DnsMessage.buildBlockedResponse(request);
 
         assertUnsignedShortEquals(0xCAFE, response, 0);
         int flags = unsignedShort(response, 2);
         assertTrue((flags & 0x8000) != 0, "response QR bit should be set");
-        assertEquals(3, flags & 0x000F);
+        assertEquals(5, flags & 0x000F);
         assertUnsignedShortEquals(1, response, 4);
         assertUnsignedShortEquals(0, response, 6);
     }
@@ -239,16 +239,19 @@ public final class AllTests {
 
         statistics.recordLocalHit();
         statistics.recordBlocked();
+        statistics.recordNxDomain();
         statistics.recordCacheHit();
         statistics.recordForwarded();
 
         assertEquals(4L, statistics.totalQueries());
         assertEquals(1L, statistics.localHits());
         assertEquals(1L, statistics.blocked());
+        assertEquals(1L, statistics.nxDomain());
         assertEquals(1L, statistics.cacheHits());
         assertEquals(1L, statistics.forwarded());
         assertTrue(statistics.summaryLine().contains("localHit=1"), statistics.summaryLine());
         assertTrue(statistics.summaryLine().contains("blocked=1"), statistics.summaryLine());
+        assertTrue(statistics.summaryLine().contains("nxDomain=1"), statistics.summaryLine());
         assertTrue(statistics.summaryLine().contains("cacheHit=1"), statistics.summaryLine());
         assertTrue(statistics.summaryLine().contains("forwarded=1"), statistics.summaryLine());
     }
