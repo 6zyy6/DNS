@@ -20,18 +20,17 @@ public final class DnsRelayServer {
     private static final int LOCAL_TTL_SECONDS = 120;
     private static final int UPSTREAM_UDP_TIMEOUT_MILLIS = 5_000;
     private static final int UPSTREAM_TCP_TIMEOUT_MILLIS = 5_000;
+    private static final int CLIENT_SOCKET_POLL_TIMEOUT_MILLIS = 30_000;
 
     private volatile LocalDnsDatabase database;
     private final InetAddress upstreamDns;
     private final int listenPort;
     private final DnsRelayConfig.DebugLevel debugLevel;
-    private final IdMapper idMapper = new IdMapper();
     private final DnsResponseCache responseCache = new DnsResponseCache();
     private final QueryStatistics statistics = new QueryStatistics();
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     private DatagramSocket clientSocket;
-    private DatagramSocket upstreamSocket;
     private ServerSocket tcpServerSocket;
 
     public DnsRelayServer(
@@ -50,7 +49,7 @@ public final class DnsRelayServer {
             clientSocket = new DatagramSocket(null);
             clientSocket.setReuseAddress(true);
             clientSocket.bind(new InetSocketAddress(listenPort));
-            upstreamSocket = new DatagramSocket();
+            clientSocket.setSoTimeout(CLIENT_SOCKET_POLL_TIMEOUT_MILLIS);
             tcpServerSocket = new ServerSocket();
             tcpServerSocket.setReuseAddress(true);
             tcpServerSocket.bind(new InetSocketAddress(listenPort));
@@ -59,15 +58,6 @@ public final class DnsRelayServer {
             stop();
             throw ex;
         }
-
-        Thread upstreamThread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                receiveUpstreamResponses();
-            }
-        }, "dnsrelay-upstream");
-        upstreamThread.setDaemon(true);
-        upstreamThread.start();
 
         Thread tcpThread = new Thread(new Runnable() {
             @Override
@@ -93,9 +83,6 @@ public final class DnsRelayServer {
         if (clientSocket != null) {
             clientSocket.close();
         }
-        if (upstreamSocket != null) {
-            upstreamSocket.close();
-        }
         if (tcpServerSocket != null) {
             try {
                 tcpServerSocket.close();
@@ -117,6 +104,8 @@ public final class DnsRelayServer {
                         new InetSocketAddress(packet.getAddress(), packet.getPort()),
                         clientSocket);
                 handleQuery(data, packet.getLength(), client);
+            } catch (SocketTimeoutException ex) {
+                // Periodic wake-up keeps the client UDP socket healthy after long idle periods on Windows.
             } catch (SocketException ex) {
                 if (running.get()) {
                     System.err.println("Client socket error: " + ex.getMessage());
@@ -164,25 +153,6 @@ public final class DnsRelayServer {
                 socket.close();
             } catch (IOException closeEx) {
                 // Ignore close errors.
-            }
-        }
-    }
-
-    private void receiveUpstreamResponses() {
-        byte[] buffer = new byte[MAX_DNS_PACKET];
-        while (running.get()) {
-            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-            try {
-                upstreamSocket.receive(packet);
-                byte[] data = new byte[packet.getLength()];
-                System.arraycopy(packet.getData(), packet.getOffset(), data, 0, packet.getLength());
-                handleUpstreamPacket(data, packet.getLength(), packet.getAddress(), packet.getPort());
-            } catch (SocketException ex) {
-                if (running.get()) {
-                    System.err.println("Upstream socket error: " + ex.getMessage());
-                }
-            } catch (Exception ex) {
-                System.err.println("Failed to handle upstream packet: " + ex.getMessage());
             }
         }
     }
@@ -235,11 +205,13 @@ public final class DnsRelayServer {
         if (cachedResponse.isPresent()) {
             statistics.recordCacheHit();
             byte[] response = DnsMessage.withId(cachedResponse.get(), cachedResponse.get().length, message.id());
+            recordNxDomainIfPresent(response, response.length);
             client.send(response);
             log(DnsRelayConfig.DebugLevel.BASIC,
                     "Cache hit: " + message.question().name()
                             + " " + queryType
-                            + " -> served from upstream cache");
+                            + describeResponseCode(response, response.length)
+                            + describeResponseTtl(cachedResponse.get(), cachedResponse.get().length));
             logStatisticsSnapshot();
             return;
         }
@@ -257,8 +229,9 @@ public final class DnsRelayServer {
 
         String queryType = describeType(message.question());
         if (local.get().isBlocked()) {
-            byte[] response = DnsMessage.buildNxDomainResponse(message);
-            log(DnsRelayConfig.DebugLevel.BASIC, "Local blocked: " + message.question().name() + " -> NXDOMAIN");
+            byte[] response = DnsMessage.buildBlockedResponse(message);
+            log(DnsRelayConfig.DebugLevel.BASIC,
+                    "Local blocked: " + message.question().name() + " -> REFUSED (rcode=5) ttl=n/a");
             return Optional.of(LocalResolution.blocked(response));
         }
 
@@ -274,7 +247,8 @@ public final class DnsRelayServer {
                     LOCAL_TTL_SECONDS);
             log(DnsRelayConfig.DebugLevel.BASIC,
                     "Local hit: " + message.question().name()
-                            + " CNAME -> " + local.get().cnameTarget().get());
+                            + " CNAME -> " + local.get().cnameTarget().get()
+                            + describeLocalTtl());
             return Optional.of(LocalResolution.localHit(response));
         }
 
@@ -290,14 +264,15 @@ public final class DnsRelayServer {
                         "Local hit: " + message.question().name()
                                 + " " + queryType
                                 + " answers=" + addresses.size()
-                                + " -> " + formatAddresses(addresses));
+                                + " -> " + formatAddresses(addresses)
+                                + describeLocalTtl());
                 return Optional.of(LocalResolution.localHit(response));
             }
             byte[] response = DnsMessage.buildEmptyResponse(message);
             log(DnsRelayConfig.DebugLevel.BASIC,
                     "Local empty: " + message.question().name()
                             + " " + queryType
-                            + " -> NOERROR with 0 answers");
+                            + " -> NOERROR with 0 answers ttl=n/a");
             return Optional.of(LocalResolution.localHit(response));
         }
 
@@ -319,40 +294,24 @@ public final class DnsRelayServer {
         return database;
     }
 
-    private void forwardQuery(byte[] data, int length, DnsMessage message, ClientContext client) throws IOException {
+    private void forwardQuery(byte[] data, int length, DnsMessage message, ClientContext client) {
         statistics.recordForwarded();
-        if (client.transport() == ClientContext.Transport.TCP) {
-            byte[] response = queryUpstreamSynchronously(data, length, message.id());
-            client.send(response);
-            return;
-        }
-        forwardToUpstreamAsync(data, length, message, client);
-    }
-
-    private void forwardToUpstreamAsync(byte[] data, int length, DnsMessage message, ClientContext client) throws IOException {
-        IdMapper.PendingQuery pending = idMapper.register(
-                message.id(),
-                client,
-                data,
-                length,
-                message.question().name(),
-                message.question().typeCode(),
-                message.question().qclass());
-        byte[] forwarded = DnsMessage.withId(data, length, pending.forwardedId());
-        DatagramPacket packet = new DatagramPacket(
-                forwarded,
-                forwarded.length,
-                new InetSocketAddress(upstreamDns, DnsMessage.DNS_PORT));
-        try {
-            upstreamSocket.send(packet);
-        } catch (IOException ex) {
-            idMapper.remove(pending.forwardedId());
-            throw ex;
-        }
         log(DnsRelayConfig.DebugLevel.BASIC,
-                "Forwarded upstream: " + message.question().name() + " originalId=" + message.id()
-                        + " forwardedId=" + pending.forwardedId());
-        logPacketSummary("forwarded", forwarded, forwarded.length);
+                "Forwarding upstream: " + message.question().name() + " id=" + message.id());
+        try {
+            byte[] response = queryUpstreamSynchronously(data, length, message.id());
+            recordNxDomainIfPresent(response, response.length);
+            client.send(response);
+        } catch (IOException ex) {
+            log(DnsRelayConfig.DebugLevel.BASIC,
+                    "Upstream query failed for " + message.question().name() + ": " + ex.getMessage());
+            try {
+                client.send(DnsMessage.buildServFailResponse(message));
+            } catch (IOException sendEx) {
+                log(DnsRelayConfig.DebugLevel.BASIC,
+                        "Failed to send SERVFAIL to client: " + sendEx.getMessage());
+            }
+        }
     }
 
     private byte[] queryUpstreamSynchronously(byte[] data, int length, int clientId) throws IOException {
@@ -360,7 +319,9 @@ public final class DnsRelayServer {
         if (!DnsMessage.isTruncated(udpResponse, udpResponse.length)) {
             storeInCache(data, length, udpResponse, udpResponse.length);
             log(DnsRelayConfig.DebugLevel.BASIC,
-                    "Upstream sync response over UDP for id " + clientId + " cacheSize=" + responseCache.size());
+                    "Upstream response over UDP for id " + clientId
+                            + describeResponseTtl(udpResponse, udpResponse.length)
+                            + " cacheSize=" + responseCache.size());
             return udpResponse;
         }
 
@@ -369,94 +330,10 @@ public final class DnsRelayServer {
         byte[] tcpResponse = queryUpstreamOverTcp(data, length, clientId);
         storeInCache(data, length, tcpResponse, tcpResponse.length);
         log(DnsRelayConfig.DebugLevel.BASIC,
-                "Upstream sync response over TCP for id " + clientId + " cacheSize=" + responseCache.size());
-        return tcpResponse;
-    }
-
-    private void handleUpstreamPacket(byte[] data, int length, InetAddress source, int sourcePort) throws IOException {
-        if (!source.equals(upstreamDns)) {
-            log(DnsRelayConfig.DebugLevel.VERBOSE, "Ignoring packet from unexpected upstream source " + source.getHostAddress());
-            return;
-        }
-        if (sourcePort != DnsMessage.DNS_PORT) {
-            log(DnsRelayConfig.DebugLevel.VERBOSE, "Ignoring packet from unexpected upstream port " + sourcePort);
-            return;
-        }
-        if (length < 2) {
-            log(DnsRelayConfig.DebugLevel.VERBOSE, "Ignoring too-short upstream packet");
-            return;
-        }
-        int forwardedId = ((data[0] & 0xFF) << 8) | (data[1] & 0xFF);
-        Optional<IdMapper.PendingQuery> pending = idMapper.lookup(forwardedId);
-        if (!pending.isPresent()) {
-            log(DnsRelayConfig.DebugLevel.VERBOSE, "No client mapping for upstream id " + forwardedId);
-            return;
-        }
-        DnsMessage upstreamMessage;
-        try {
-            upstreamMessage = DnsMessage.parse(data, length);
-        } catch (DnsParseException ex) {
-            log(DnsRelayConfig.DebugLevel.VERBOSE, "Ignoring malformed upstream response: " + ex.getMessage());
-            return;
-        }
-        if (!upstreamMessage.isResponse()) {
-            log(DnsRelayConfig.DebugLevel.VERBOSE, "Ignoring upstream packet without response bit");
-            return;
-        }
-        if (!pending.get().queryName().equals(upstreamMessage.question().name())
-                || pending.get().queryType() != upstreamMessage.question().typeCode()
-                || pending.get().queryClass() != upstreamMessage.question().qclass()) {
-            log(DnsRelayConfig.DebugLevel.VERBOSE,
-                    "Ignoring upstream response with mismatched question for id " + forwardedId);
-            return;
-        }
-
-        byte[] finalResponse = data;
-        int finalLength = length;
-        if (DnsMessage.isTruncated(data, length)) {
-            log(DnsRelayConfig.DebugLevel.BASIC,
-                    "Upstream UDP response truncated for id " + forwardedId + "; retrying over TCP");
-            try {
-                byte[] tcpResponse = queryUpstreamOverTcp(
-                        pending.get().queryData(),
-                        pending.get().queryData().length,
-                        pending.get().originalId());
-                finalResponse = tcpResponse;
-                finalLength = tcpResponse.length;
-            } catch (IOException ex) {
-                log(DnsRelayConfig.DebugLevel.BASIC,
-                        "TCP retry failed for id " + forwardedId + ": " + ex.getMessage()
-                                + "; forwarding truncated UDP response");
-            }
-        }
-
-        idMapper.remove(forwardedId);
-        storeInCache(
-                pending.get().queryName(),
-                pending.get().queryType(),
-                pending.get().queryClass(),
-                finalResponse,
-                finalLength);
-        byte[] restored = DnsMessage.withId(finalResponse, finalLength, pending.get().originalId());
-        pending.get().client().send(restored);
-        try {
-            upstreamMessage = DnsMessage.parse(finalResponse, finalLength);
-        } catch (DnsParseException ex) {
-            log(DnsRelayConfig.DebugLevel.VERBOSE,
-                    "Final upstream response could not be parsed; using original UDP header: " + ex.getMessage());
-        }
-        logHeader("upstream", upstreamMessage);
-        log(DnsRelayConfig.DebugLevel.VERBOSE,
-                "upstream source=" + source.getHostAddress()
-                        + " length=" + finalLength
-                        + " rcode=" + (upstreamMessage.flags() & 0x000F));
-        logPacketSummary("upstream", finalResponse, finalLength);
-        log(DnsRelayConfig.DebugLevel.BASIC,
-                "Upstream response id " + forwardedId + " restored to " + pending.get().originalId()
-                        + " for " + pending.get().client().transport() + " " + pending.get().client().remoteAddress()
-                        + " qname=" + pending.get().queryName()
-                        + " qtype=" + pending.get().queryType()
+                "Upstream response over TCP for id " + clientId
+                        + describeResponseTtl(tcpResponse, tcpResponse.length)
                         + " cacheSize=" + responseCache.size());
+        return tcpResponse;
     }
 
     private byte[] queryUpstreamOverUdp(byte[] data, int length, int clientId) throws IOException {
@@ -572,6 +449,42 @@ public final class DnsRelayServer {
         if (debugLevel.ordinal() >= minimum.ordinal()) {
             System.out.println(message);
         }
+    }
+
+    private void recordNxDomainIfPresent(byte[] response, int length) {
+        if (DnsMessage.responseCode(response, length) == 3) {
+            statistics.recordNxDomain();
+        }
+    }
+
+    private String describeResponseCode(byte[] response, int length) {
+        int rcode = DnsMessage.responseCode(response, length);
+        if (rcode == 3) {
+            return " -> NXDOMAIN (rcode=3)";
+        }
+        if (rcode == 5) {
+            return " -> REFUSED (rcode=5)";
+        }
+        if (rcode == 2) {
+            return " -> SERVFAIL (rcode=2)";
+        }
+        if (rcode == 0) {
+            return " -> NOERROR (rcode=0)";
+        }
+        return " -> rcode=" + rcode;
+    }
+
+    private String describeLocalTtl() {
+        return " ttl=" + LOCAL_TTL_SECONDS + "s";
+    }
+
+    private String describeResponseTtl(byte[] response, int length) {
+        int responseTtl = DnsResponseCache.extractTtlSeconds(response, length);
+        int cacheTtl = DnsResponseCache.effectiveCacheTtlSeconds(response, length);
+        if (cacheTtl == responseTtl) {
+            return " ttl=" + cacheTtl + "s";
+        }
+        return " ttl=" + responseTtl + "s cacheTtl=" + cacheTtl + "s";
     }
 
     private void logStatisticsSnapshot() {

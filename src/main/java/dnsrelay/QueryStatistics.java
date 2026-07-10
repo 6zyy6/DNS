@@ -6,6 +6,7 @@ public final class QueryStatistics {
     private final AtomicLong totalQueries = new AtomicLong();
     private final AtomicLong localHits = new AtomicLong();
     private final AtomicLong blocked = new AtomicLong();
+    private final AtomicLong nxDomain = new AtomicLong();
     private final AtomicLong cacheHits = new AtomicLong();
     private final AtomicLong forwarded = new AtomicLong();
 
@@ -17,6 +18,10 @@ public final class QueryStatistics {
     public void recordBlocked() {
         totalQueries.incrementAndGet();
         blocked.incrementAndGet();
+    }
+
+    public void recordNxDomain() {
+        nxDomain.incrementAndGet();
     }
 
     public void recordCacheHit() {
@@ -41,6 +46,10 @@ public final class QueryStatistics {
         return blocked.get();
     }
 
+    public long nxDomain() {
+        return nxDomain.get();
+    }
+
     public long cacheHits() {
         return cacheHits.get();
     }
@@ -53,6 +62,7 @@ public final class QueryStatistics {
         return "Query stats: total=" + totalQueries.get()
                 + " localHit=" + localHits.get()
                 + " blocked=" + blocked.get()
+                + " nxDomain=" + nxDomain.get()
                 + " cacheHit=" + cacheHits.get()
                 + " forwarded=" + forwarded.get();
     }

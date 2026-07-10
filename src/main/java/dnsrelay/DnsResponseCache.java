@@ -50,7 +50,11 @@ public final class DnsResponseCache {
         }
     }
 
-    static int extractTtlSeconds(byte[] data, int length) {
+    public static int effectiveCacheTtlSeconds(byte[] data, int length) {
+        return clampTtl(extractTtlSeconds(data, length));
+    }
+
+    public static int extractTtlSeconds(byte[] data, int length) {
         if (length < DnsMessage.HEADER_LENGTH) {
             return DEFAULT_NEGATIVE_TTL_SECONDS;
         }

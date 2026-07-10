@@ -9,7 +9,7 @@
 - 文本库支持 IPv4、IPv6，同一域名可写多行来返回多个 A / AAAA。
 - A 记录本地命中时直接返回本地 IPv4；AAAA 记录本地命中时直接返回本地 IPv6。
 - 本地域名存在但没有对应 A/AAAA 时，返回 **空 NOERROR 响应**（0 条 Answer），避免浏览器同时发 A/AAAA 时重复走上游。
-- 本地 IP 为 `0.0.0.0` 时返回 NXDOMAIN，用于屏蔽域名；屏蔽域名对 A/AAAA 统一 NXDOMAIN。
+- 本地 IP 为 `0.0.0.0` 时返回 **REFUSED (rcode=5)**，用于屏蔽域名；与上游返回的 **NXDOMAIN (rcode=3)** 可区分。
 - 未命中时转发到上游 DNS 的 53 端口。
 - 上游 **UDP 响应带 TC（截断）** 时，自动改用 **TCP** 重试上游。
 - **上游响应缓存**：转发得到的 DNS 响应会按 TTL 缓存在内存中，相同查询在过期前直接返回。
@@ -32,11 +32,11 @@
 | 本地有对应 A/AAAA | 直接返回本地地址 |
 | 本地有 CNAME，查询类型为 CNAME | 返回本地 CNAME |
 | 本地有该域名，但没有请求的 A/AAAA | 返回空 NOERROR（不转发上游） |
-| 本地 `0.0.0.0` 屏蔽 | A/AAAA 均返回 NXDOMAIN |
-| 本地未配置该域名 | 转发上游 |
+| 本地 `0.0.0.0` 屏蔽 | 返回 **REFUSED (rcode=5)**，nslookup 显示 Query refused |
+| 本地未配置该域名 | 转发上游；不存在时上游返回 **NXDOMAIN (rcode=3)** |
 | 本地未配置 MX/PTR 等其它类型 | 转发上游 |
 
-与示例报告的关系：示例报告建议“本地只有 IPv4 时对 AAAA 返回空响应”；当前实现遵循这一点，并扩展支持本地 AAAA 命中、本地 CNAME，以及屏蔽域名统一 NXDOMAIN。
+与示例报告的关系：示例报告建议“本地只有 IPv4 时对 AAAA 返回空响应”；当前实现遵循这一点，并扩展支持本地 AAAA 命中、本地 CNAME，以及屏蔽域名返回 REFUSED 以便与上游 NXDOMAIN 区分。
 
 ## 上游响应缓存
 
@@ -48,6 +48,8 @@
 | TTL 限制 | 最短 1 秒，最长 3600 秒 |
 | 负缓存 | 无 Answer 且返回错误码时，默认缓存 60 秒 |
 | 热加载 | `dnsrelay.txt` 变更并重载后，清空全部上游缓存 |
+
+上游转发采用**每次查询独立 UDP/TCP 连接**，避免 Windows 下长时间空闲后共享 upstream socket 失效；上游失败时返回 `SERVFAIL`，不再让客户端一直等到 timeout。
 
 验证缓存：
 
@@ -66,14 +68,28 @@ nslookup www.baidu.com 127.0.0.1
 | 统计项 | 含义 |
 |--------|------|
 | 本地命中 | 本地库直接应答（含 A/AAAA/CNAME 命中及本地空 NOERROR） |
-| 屏蔽 | 本地 `0.0.0.0` 返回 NXDOMAIN |
+| 屏蔽 | 本地 `0.0.0.0` 返回 REFUSED (rcode=5) |
+| nxDomain | 上游判定域名不存在，返回 NXDOMAIN (rcode=3) |
 | 缓存命中 | 上游响应缓存命中 |
 | 转发 | 转发到上游 DNS（含 TCP 同步转发） |
 
+输出示例：
+
+```text
+Query stats: total=8 localHit=3 blocked=1 nxDomain=2 cacheHit=1 forwarded=2
+```
+
+客户端如何区分：
+
+| 场景 | nslookup 典型表现 | 日志 |
+|------|-------------------|------|
+| 屏蔽 `blocked.test` | `Query refused` | `Local blocked: ... -> REFUSED (rcode=5)` |
+| 不存在域名 | `Non-existent domain` | `Upstream response ... -> NXDOMAIN (rcode=3)` |
+
 输出方式：
 
-- 程序正常退出时打印一行汇总，例如：`Query stats: total=8 localHit=3 blocked=1 cacheHit=2 forwarded=2`
-- 使用 `-d` 或 `-dd` 时，每次成功处理的查询后也会打印当前累计值
+- 程序正常退出时打印一行汇总，例如：`Query stats: total=8 localHit=3 blocked=1 nxDomain=2 cacheHit=1 forwarded=2`
+- 使用 `-d` 或 `-dd` 时，日志会附带 TTL 信息：本地应答显示 `ttl=120s`，上游/缓存应答显示响应 TTL 及缓存 TTL（`cacheTtl`，上限 3600s）。
 
 ## 本地数据库格式
 
@@ -163,7 +179,7 @@ nslookup -type=CNAME alias.test 127.0.0.1
 
 - `local.test` A → `1.2.3.4`
 - `local.test` AAAA → 空响应（非 NXDOMAIN）
-- `blocked.test` → NXDOMAIN
+- `blocked.test` → Query refused（REFUSED）
 - `www.bupt.com.cn` → `114.255.40.66`
 - `www.baidu.com` 第一次转发上游，第二次命中缓存
 

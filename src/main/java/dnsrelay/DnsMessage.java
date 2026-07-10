@@ -96,10 +96,22 @@ public final class DnsMessage {
     }
 
     public static byte[] buildNxDomainResponse(DnsMessage request) {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        writeHeader(out, request, 3, 0);
-        writeQuestion(out, request);
-        return out.toByteArray();
+        return buildErrorResponse(request, 3);
+    }
+
+    public static byte[] buildBlockedResponse(DnsMessage request) {
+        return buildErrorResponse(request, 5);
+    }
+
+    public static byte[] buildServFailResponse(DnsMessage request) {
+        return buildErrorResponse(request, 2);
+    }
+
+    public static int responseCode(byte[] data, int length) {
+        if (length < 4) {
+            return -1;
+        }
+        return unsignedShort(data, 2) & 0x000F;
     }
 
     public static byte[] buildEmptyResponse(DnsMessage request) {
@@ -180,6 +192,17 @@ public final class DnsMessage {
 
     public DnsQuestion question() {
         return question;
+    }
+
+    public int responseCode() {
+        return flags & 0x000F;
+    }
+
+    private static byte[] buildErrorResponse(DnsMessage request, int rcode) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeHeader(out, request, rcode, 0);
+        writeQuestion(out, request);
+        return out.toByteArray();
     }
 
     private static void writeHeader(ByteArrayOutputStream out, DnsMessage request, int rcode, int answerCount) {
